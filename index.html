@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>地铁实时运行图</title>
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; overflow: hidden; background: #f5f5f5; }
+
+        /* --- 核心控制区样式 --- */
+        #controls {
+            position: fixed; bottom: 20px; left: 5%; width: 90%;
+            background: rgba(255, 255, 255, 0.9); padding: 15px; border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); backdrop-filter: blur(5px);
+            z-index: 100; display: flex; flex-direction: column; gap: 10px;
+        }
+        .status-bar { display: flex; justify-content: space-between; align-items: center; }
+        .time-display { font-size: 1.2em; font-weight: bold; color: #333; font-variant-numeric: tabular-nums; }
+        .mode-switch { font-size: 0.9em; color: #666; display: flex; align-items: center; gap: 5px; }
+
+        /* ================= 修改：自定义滑块样式 (解决手指遮挡问题) ================= */
+        .slider-wrapper {
+            position: relative;
+            width: 100%;
+            height: 50px; /* 整个触控区域高度，足够大以便手指操作 */
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start; /* 视觉元素靠上 */
+            margin-top: 5px;
+        }
+
+        /* 1. 视觉轨道 (细线/窄矩形) */
+        .visual-track {
+            position: absolute;
+            top: 12px; /* 距离顶部的位置 */
+            left: 0;
+            width: 100%;
+            height: 4px; /* 线条厚度 */
+            /* 漂亮的渐变色: 深蓝(深夜)-黄(早)-绿(平峰)-橙(晚)-红(停运)-深灰 */
+            /* 根据非线性比例调整颜色分布：
+            0% - 20%: 早高峰前 (灰/黄) - 对应较短长度
+            20% - 35%: 白天平峰 (绿) - 对应极短长度 (虽然时间长，但被压缩了)
+            35% - 90%: 晚间收车 (橙/红) - 🚨 占据了 55% 的长度，非常显眼且灵敏
+            90% - 100%: 深夜 (深灰)
+            */
+            background: linear-gradient(to right,
+                #34495e 0%,
+                #f1c40f 20%,
+                #2ecc71 20%,
+                #2ecc71 35%,
+                #e67e22 35%,
+                #c0392b 90%,
+                #2c3e50 90%
+            );
+            border-radius: 2px;
+            pointer-events: none; /* 让点击穿透过去 */
+            z-index: 1;
+        }
+
+        /* 2. 视觉指针 (指示当前位置) */
+        .visual-thumb {
+            position: absolute;
+            top: 0;
+            left: 0%; /* JS 动态控制这里 */
+            width: 2px; /* 指针那根线的宽度 */
+            height: 28px; /* 指针高度，穿过轨道 */
+            background: #e74c3c; /* 红色指针 */
+            z-index: 2;
+            transform: translateX(-50%); /* 居中对齐 */
+            pointer-events: none;
+            /* transition: left 0.1s linear;  拖动时为了跟手，建议关掉 CSS 过渡，或者只在 tick 时开启 */
+        }
+
+        /* 给指针加个“头”，看起来更像指针 */
+        .visual-thumb::after {
+            content: '';
+            position: absolute;
+            top: -4px;
+            left: -4px;
+            width: 10px;
+            height: 10px;
+            background: #e74c3c;
+            border-radius: 50%;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        }
+
+        /* 3. 实际交互的 Input (隐形、巨大) */
+        input[type=range] {
+            position: absolute;
+            bottom: 0; /* 放在底部，让用户摸下面 */
+            left: 0;
+            width: 100%;
+            height: 40px; /* 触控区域高度 */
+            opacity: 0; /* 完全透明，不可见 */
+            margin: 0;
+            padding: 0;
+            z-index: 3; /* 在最上层接收点击 */
+            cursor: pointer;
+        }
+
+        /* --- 地图容器 --- */
+        #map-container {
+            width: 100vw; height: 100vh; overflow: hidden; background: #f5f5f5; position: relative;
+        }
+        /* #map-container:active { cursor: grabbing; } */
+
+        /* SVG 样式 */
+        svg { width: 100%; height: 100%; display: block; touch-action: none; }
+
+        /* 路径过渡动画 */
+        path { transition: stroke 0.5s ease, opacity 0.5s ease, filter 0.5s ease; }
+        rect { transition: fill 0.5s ease, stroke 0.5s ease, opacity 0.5s ease, filter 0.5s ease; }
+        polygon { transition: fill 0.5s ease, stroke 0.5s ease, opacity 0.5s ease, filter 0.5s ease; }
+
+        /* ================= 样式修正 ================= */
+
+        /* 1. 针对线路 (所有 ID 以 "seg_" 开头的元素) */
+        [id^="seg_"].disabled {
+            stroke: #dcdcdc !important;   /* 线条变灰 */
+            stroke-opacity: 0.3 !important;
+
+            fill: none !important;        /* 🚨 关键！强制禁止填充，消除奇怪的三角区 */
+        }
+
+        /* 2. 针对车站 (所有 ID 以 "station_" 开头的元素) */
+        [id^="station_"].disabled {
+            fill: #dcdcdc !important;     /* 填充变灰 */
+            fill-opacity: 0.3 !important;
+
+            stroke: #dcdcdc !important;      /*车站通常不需要描边，或者保持原样*/
+        }
+
+        /* --- 信息弹窗样式 --- */
+        #info-modal {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            max-height: 50vh; /* 最多占一半屏幕 */
+            background: white;
+            box-shadow: 0 -2px 10px rgba(0,0,0,0.2);
+            z-index: 200; /* 比控制栏更高 */
+            border-radius: 12px 12px 0 0;
+            overflow-y: auto;
+            transition: transform 0.3s ease;
+            padding-bottom: 20px;
+            box-sizing: border-box;
+        }
+
+        .modal-header {
+            padding: 15px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            background: white;
+        }
+
+        .modal-header h3 { margin: 0; font-size: 1.1em; }
+
+        .modal-body { padding: 15px; font-size: 0.9em; line-height: 1.6; }
+
+        .info-block { margin-bottom: 15px; }
+        .info-label { font-weight: bold; color: #666; display: block; margin-bottom: 4px; }
+        .info-value { color: #333; }
+        .dep-list { font-family: monospace; background: #f5f5f5; padding: 5px; border-radius: 4px; word-break: break-all;}
+    </style>
+</head>
+
+<body>
+
+    <div id="map-container">
+        <div id="loading-tip" style="position:absolute; top: 40%; width: 100%; text-align: center; color: #666;">
+            正在加载地图资源...
+        </div>
+    </div>
+
+    <div id="controls">
+        <div class="status-bar">
+            <div class="time-display" id="clock">12:00</div>
+            <label class="mode-switch">
+                <input type="checkbox" id="live-toggle" checked> 实时模式
+            </label>
+        </div>
+
+        <div class="slider-wrapper">
+            <div class="visual-track"></div>
+            <div class="visual-thumb" id="custom-thumb"></div>
+
+            <input type="range" id="time-slider" min="0" max="10000" value="0">
+        </div>
+
+        <div style="font-size: 12px; color: #999; text-align: center; margin-top: -10px; pointer-events: none;">
+            手指在下方空白处拖动，观察上方红线 (06:00 - 次日02:00)
+        </div>
+    </div>
+
+    <div id="info-modal" style="display: none;">
+        <div class="modal-header">
+            <h3 id="modal-title">站点名称</h3>
+            <button onclick="closeModal()" style="padding: 5px 10px;">×</button>
+        </div>
+        <div id="modal-content" class="modal-body"></div>
+    </div>
+
+    <script src="https://unpkg.com/panzoom@9.4.0/dist/panzoom.min.js"></script>
+    <script>
+        // ================= 配置区域 =================
+
+        // 【新增】车站编号修正表
+        // 格式: "线路编号_JSON中的车站号": "SVG中的车站号"
+        const STATION_ID_FIX_MAP = {
+            "330103_0112": "0330", // 武林广场 (3号线吴山前村-星桥, JSON原号:0112)
+            "330103_0113": "0331", // 西湖文化广场 (3号线吴山前村-星桥, JSON原号:0113)
+            "330103_0501": "0315", // 绿汀路 (3号线吴山前村-星桥, JSON原号:0501)
+            "330103_1902": "0312", // 火车西站 (3号线吴山前村-星桥, JSON原号:1902)
+            "330104_0106": "0409", // 近江 (4号线, JSON原号:0106)
+            "330104_0116": "0417", // 火车东站 (4号线, JSON原号:0116)
+            "330104_0117": "0418", // 彭埠 (4号线, JSON原号:0117)
+            "330104_0213": "0413", // 钱江路 (4号线, JSON原号:0213)
+            "330104_0336": "0423", // 新天地街 (4号线, JSON原号:0336)
+            "330106_0105": "0632", // 江陵路 (6号线桂花西路-枸桔弄, JSON原号:0105)
+            "330106_0403": "0626", // 中医药大学 (6号线桂花西路-枸桔弄, JSON原号:0403)
+            "330107_0133": "0717", // 萧山国际机场 (7号线, JSON原号:0133)
+            "330107_0940": "0704", // 观音塘 (7号线, JSON原号:0940)
+            "330109_0121": "0950", // 客运中心 (9号线, JSON原号:0121)
+            "330110_0222": "1004", // 学院路 (10号线, JSON原号:0222)
+            "330118_0105": "0632", // 江陵路 (6号线双浦-枸桔弄, JSON原号:0105)
+            "330118_0403": "0626", // 中医药大学 (6号线双浦-枸桔弄, JSON原号:0403)
+            "330119_0112": "0330", // 武林广场 (3号线石马-星桥, JSON原号:0112)
+            "330119_0113": "0331", // 西湖文化广场 (3号线石马-星桥, JSON原号:0113)
+            "330122_0501": "1612", // 绿汀路 (16号线, JSON原号:0501)
+            "330123_0133": "1917", // 萧山国际机场 (19号线, JSON原号:0133)
+            "330123_0718": "1918", // 永盛路 (19号线, JSON原号:0718)
+        };
+        // ===================================================
+
+        // 辅助函数：获取修正后的 ID
+        function getFixedStationNo(lineNo, rawStationNo) {
+            const key = `${lineNo}_${rawStationNo}`;
+            // 如果表里有修正值，就用修正值；否则用原始值
+            return STATION_ID_FIX_MAP[key] || rawStationNo;
+        }
+
+        // ... 你的 SVG_URL 等其他配置 ...
+        const SVG_URL = 'station_renamed_processed_merged_all_segmented_processed_renamed_by_geometry_plain.svg';
+
+        // ================= 全局变量 =================
+        let scheduleMap = {};
+        let stationDependencyMap = {}; // 新增：存储 { "station_ID": ["seg_ID_1", "seg_ID_2"...] }
+        let stationRawData = {}; // 【新增】存储人类可读的车站时刻表信息 { "0101": Object }
+        let activeSegmentsCache = new Set();
+        let isLiveMode = true;
+        let mapPanzoom;
+
+        // 【关键修复1】将 UI 元素提升为全局变量
+        let slider, clock, liveToggle;
+        let visualThumb; // 新增：视觉指针
+        // ================= 非线性滑块配置 (灵敏度控制) =================
+        // 定义一天的起始时间: 04:00 (240分) 到 次日 04:00 (1680分)
+        const START_MIN = 240;
+        const END_MIN = 1680;
+
+        // 时间分段策略 (权重 weight 总和必须为 100)
+        const TIME_SEGMENTS = [
+            // 1. 早间启动 (04:00 - 06:30): 权重 20%
+            { endMinute: 390,  weight: 20 },
+            // 2. 白天平峰 (06:30 - 21:30): 权重 15% (严重压缩，因为不需要细看)
+            { endMinute: 1290, weight: 15 },
+            // 3. 晚间停运 (21:30 - 00:30): 权重 55% (🌟极高灵敏度，拉长显示)
+            { endMinute: 1470, weight: 55 },
+            // 4. 深夜时段 (00:30 - 04:00): 权重 10%
+            { endMinute: 1680, weight: 10 }
+        ];
+
+        // 算法：滑块位置 (0-10000) -> 实际分钟
+        function getMinutesFromSlider(sliderVal) {
+            const percent = sliderVal / 10000 * 100;
+            let accWeight = 0;
+            let prevMin = START_MIN;
+
+            for (const seg of TIME_SEGMENTS) {
+                if (percent <= accWeight + seg.weight) {
+                    const segPercent = (percent - accWeight) / seg.weight;
+                    return Math.floor(prevMin + (seg.endMinute - prevMin) * segPercent);
+                }
+                accWeight += seg.weight;
+                prevMin = seg.endMinute;
+            }
+            return END_MIN;
+        }
+
+        // 算法：实际分钟 -> 滑块位置 (0-10000)
+        function getSliderFromMinutes(minutes) {
+            if (minutes < START_MIN) minutes += 1440; // 跨日修正
+            if (minutes > END_MIN) minutes = END_MIN;
+
+            let accWeight = 0;
+            let prevMin = START_MIN;
+
+            for (const seg of TIME_SEGMENTS) {
+                if (minutes <= seg.endMinute) {
+                    const segPercent = (minutes - prevMin) / (seg.endMinute - prevMin);
+                    const totalPercent = accWeight + (segPercent * seg.weight);
+                    return Math.floor(totalPercent / 100 * 10000);
+                }
+                accWeight += seg.weight;
+                prevMin = seg.endMinute;
+            }
+            return 10000;
+        }
+        // ================= 工具函数 =================
+        function parseTime(timeStr) {
+            if (!timeStr || typeof timeStr !== 'string') return null;
+            const cleanStr = timeStr.trim();
+            if (cleanStr === "") return null;
+            const parts = cleanStr.split(':');
+            if (parts.length < 2) return null;
+            let h = parseInt(parts[0], 10);
+            let m = parseInt(parts[1], 10);
+            if (isNaN(h) || isNaN(m)) return null;
+            if (h < 4) h += 24;
+            return h * 60 + m;
+        }
+
+        function formatTime(minutes) {
+            let h = Math.floor(minutes / 60);
+            let m = Math.floor(minutes % 60);
+            if (h >= 24) h -= 24;
+            return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+        }
+
+        // ================= 加载器 =================
+        async function loadSVG() {
+            try {
+                const response = await fetch(SVG_URL);
+                if (!response.ok) throw new Error('SVG 加载失败');
+                let svgText = await response.text();
+
+                // 清洗 SVG
+                svgText = svgText.replace(/<svg:svg/g, '<svg');
+                svgText = svgText.replace(/<\/svg:svg>/g, '</svg>');
+                svgText = svgText.replace(/width="[^"]*"/, 'width="100%"');
+                svgText = svgText.replace(/height="[^"]*"/, 'height="100%"');
+
+                const container = document.getElementById('map-container');
+                container.innerHTML = svgText;
+
+                // 初始化 Panzoom
+                const svgElement = container.querySelector('svg');
+                if (svgElement) {
+                    mapPanzoom = panzoom(svgElement, {
+                        maxZoom: 50, minZoom: 0.1, initialZoom: 1,
+                        bounds: true, boundsPadding: 0.1,
+                        onTouch: function(e) { return false; } // 允许默认手势
+                    });
+                    console.log("地图缩放功能已启用");
+                }
+            } catch (e) {
+                console.error(e);
+                alert("地图 SVG 加载失败");
+            }
+        }
+
+        async function loadAllData() {
+            try {
+                const response = await fetch('data/file_list.json');
+                if (!response.ok) throw new Error('无法读取文件列表 file_list.json');
+                const fileList = await response.json();
+
+                const promises = fileList.map(filename =>
+                    fetch(`data/${filename}`).then(res => res.json())
+                );
+                const results = await Promise.all(promises);
+
+                let allStations = [];
+                results.forEach(data => {
+                    if (data && data.result && data.result.station_list) {
+                        allStations = allStations.concat(data.result.station_list);
+                    }
+                });
+                return allStations;
+            } catch (e) {
+                console.error(e);
+                return [];
+            }
+        }
+
+        // ================= 终极版 processData (利用端点数据) =================
+        function processData(stationList) {
+            const map = {};
+
+            // 1. 排序
+            stationList.sort((a, b) => {
+                if (a.line_no !== b.line_no) return a.line_no - b.line_no;
+                return a.up_ordinal - b.up_ordinal;
+            });
+
+            // 辅助函数 (保持不变)
+            function findValidId(prefix, id1, id2) {
+                const candidate1 = `${prefix}_${id1}_${id2}`;
+                const candidate2 = `${prefix}_${id2}_${id1}`;
+                if (document.getElementById(candidate1)) return candidate1;
+                if (document.getElementById(candidate2)) return candidate2;
+                return null;
+            }
+
+            for (let i = 0; i < stationList.length - 1; i++) {
+                const curr = stationList[i];
+                const next = stationList[i + 1];
+
+                // 获取修正后的 ID (用于 SVG 查找)
+                const currNo = (typeof getFixedStationNo === 'function') ?
+                               getFixedStationNo(curr.line_no, curr.station_no) : curr.station_no;
+                const nextNo = (typeof getFixedStationNo === 'function') ?
+                               getFixedStationNo(next.line_no, next.station_no) : next.station_no;
+
+                // 存储 RawData
+                if (!stationRawData[currNo]) stationRawData[currNo] = { name: curr.station_name, line: curr.line_name, timetables: curr.first_last_weekdays };
+                if (!stationRawData[nextNo]) stationRawData[nextNo] = { name: next.station_name, line: next.line_name, timetables: next.first_last_weekdays };
+
+                if (curr.line_no !== next.line_no) continue;
+
+                // ================= 上行处理 (Up): Curr -> Next =================
+                let upStart = Infinity, upEnd = -Infinity, hasUp = false;
+                // 标记 next 是否为某种列车的终点
+                let isNextIsTerminal = false;
+
+                if (curr.first_last_weekdays) {
+                    curr.first_last_weekdays.forEach(plan => {
+                        if (plan.up_first_time && plan.up_last_time) {
+                            const s = parseTime(plan.up_first_time);
+                            const e = parseTime(plan.up_last_time);
+                            if (s !== null && e !== null) {
+                                upStart = Math.min(upStart, s);
+                                upEnd = Math.max(upEnd, e);
+                                hasUp = true;
+
+                                // 【核心修改】检查数据里的终点信息
+                                // 注意：用原始 JSON 的 station_no 进行比对
+                                if (plan.up_end_station_no === next.station_no) {
+                                    isNextIsTerminal = true;
+                                }
+                            }
+                        }
+                    });
+                }
+
+                if (hasUp && isFinite(upStart) && isFinite(upEnd)) {
+                    const timeWindow = { start: upStart, end: upEnd };
+
+                    // 1. 主区间 (Curr -> Next)
+                    const mainId = findValidId('seg_up', currNo, nextNo);
+                    if (mainId) map[mainId] = timeWindow;
+
+                    // 2. 出发站自环 (Curr -> Curr)
+                    // 逻辑：只要车从 Curr 发出，Curr 站内的上行轨道就是亮的
+                    const startLoopId = `seg_up_${currNo}_${currNo}`;
+                    if (document.getElementById(startLoopId)) {
+                        map[startLoopId] = timeWindow;
+                    }
+
+                    // 3. 终点站自环 (Next -> Next)
+                    // 逻辑：如果 Next 是这趟车的终点，把 Next 的自环也点亮
+                    if (isNextIsTerminal) {
+                        const endLoopId = `seg_up_${nextNo}_${nextNo}`;
+                        if (document.getElementById(endLoopId)) {
+                            map[endLoopId] = timeWindow;
+                        }
+                    }
+                }
+
+                // ================= 下行处理 (Down): Next -> Curr =================
+                let downStart = Infinity, downEnd = -Infinity, hasDown = false;
+                let isCurrIsTerminal = false;
+
+                if (next.first_last_weekdays) {
+                    next.first_last_weekdays.forEach(plan => {
+                        if (plan.down_first_time && plan.down_last_time) {
+                            const s = parseTime(plan.down_first_time);
+                            const e = parseTime(plan.down_last_time);
+                            if (s !== null && e !== null) {
+                                downStart = Math.min(downStart, s);
+                                downEnd = Math.max(downEnd, e);
+                                hasDown = true;
+
+                                // 【核心修改】检查是否在 Curr 站终到
+                                if (plan.down_end_station_no === curr.station_no) {
+                                    isCurrIsTerminal = true;
+                                }
+                            }
+                        }
+                    });
+                }
+
+                if (hasDown && isFinite(downStart) && isFinite(downEnd)) {
+                    const timeWindow = { start: downStart, end: downEnd };
+
+                    // 1. 主区间 (Next -> Curr)
+                    const mainId = findValidId('seg_down', nextNo, currNo);
+                    if (mainId) map[mainId] = timeWindow;
+
+                    // 2. 出发站自环 (Next -> Next，因为下行是从 Next 发车)
+                    const startLoopId = `seg_down_${nextNo}_${nextNo}`;
+                    if (document.getElementById(startLoopId)) {
+                        map[startLoopId] = timeWindow;
+                    }
+
+                    // 3. 终点站自环 (Curr -> Curr)
+                    if (isCurrIsTerminal) {
+                        const endLoopId = `seg_down_${currNo}_${currNo}`;
+                        if (document.getElementById(endLoopId)) {
+                            map[endLoopId] = timeWindow;
+                        }
+                    }
+                }
+            }
+
+            return map;
+        }
+
+        // ================= 交互逻辑：点击显示信息 =================
+
+        const modal = document.getElementById('info-modal');
+        const modalTitle = document.getElementById('modal-title');
+        const modalContent = document.getElementById('modal-content');
+
+        // 关闭弹窗
+        window.closeModal = function() {
+            modal.style.display = 'none';
+        }
+
+        // 格式化分钟数为 HH:mm
+        function minToTime(m) {
+            if (!isFinite(m)) return "N/A";
+            let h = Math.floor(m / 60);
+            let min = Math.floor(m % 60);
+            if (h >= 24) h -= 24;
+            return `${h.toString().padStart(2, '0')}:${min.toString().padStart(2, '0')}`;
+        }
+
+        // 处理地图点击
+        function handleMapClick(e) {
+            // 1. 找到被点击的元素 (处理 SVG 冒泡)
+            let target = e.target;
+
+            // 如果点到了 path 内部的文字或其他子元素，向外找直到找到 ID
+            while (target && target.tagName !== 'svg' && !target.id) {
+                target = target.parentNode;
+            }
+
+            if (!target || !target.id) return;
+
+            const id = target.id;
+
+            // --- 情况 A: 点击了车站 (ID 以 station_ 开头) ---
+            if (id.startsWith('station_')) {
+                // 提取纯数字编号 (例如 station_0101_up -> 0101)
+                // 假设 ID 格式为 station_XXXX 或 station_XXXX_up/down
+                const match = id.match(/station_(\d+)/);
+                if (!match) return;
+
+                const stationNo = match[1];
+                const data = stationRawData[stationNo];
+                const dependencies = stationDependencyMap[id] || [];
+
+                if (data) {
+                    modalTitle.textContent = `${data.name} (${data.line})`;
+
+                    let html = `
+                                                <div class="info-block">
+                            <span class="info-label">车站 ID:</span>
+                            <span class="info-value">${id}</span>
+                        </div>
+                        <div class="info-block">
+                        <span class="info-label">首末班车时刻:</span>`;
+
+                    // 遍历时刻表显示详细信息
+                    data.timetables.forEach(t => {
+                        // 上行
+                        if (t.up_end_station_name) {
+                            html += `<div>上行🟢 往 ${t.up_end_station_name}: ${t.up_first_time || '--'} / ${t.up_last_time || '--'}</div>`;
+                        }
+                        // 下行
+                        if (t.down_end_station_name) {
+                            html += `<div>下行🔵 往 ${t.down_end_station_name}: ${t.down_first_time || '--'} / ${t.down_last_time || '--'}</div>`;
+                        }
+                    });
+
+                    html += `</div>`;
+
+                    // 显示 Render 依赖信息
+                    html += `<div class="info-block">
+                        <span class="info-label">Render 依赖 (调试用):</span>
+                        <div class="dep-list">`;
+
+                    if (dependencies.length === 0) {
+                        html += "无依赖 (孤岛)";
+                    } else {
+                        dependencies.forEach(segId => {
+                            const isActive = activeSegmentsCache.has(segId);
+                            const statusIcon = isActive ? "✅" : "⬛";
+                            html += `<div>${statusIcon} ${segId}</div>`;
+                        });
+                    }
+                    html += `</div></div>`;
+
+                    modalContent.innerHTML = html;
+                    modal.style.display = 'block';
+                }
+            }
+
+            // --- 情况 B: 点击了线路 (ID 以 seg_ 开头) ---
+            else if (id.startsWith('seg_')) {
+                const windowData = scheduleMap[id];
+
+                if (windowData) {
+                    modalTitle.textContent = "区间线路信息";
+
+                    // 解析 ID 里的站点编号来看看是哪儿到哪儿
+                    // ID 格式: seg_up_0101_0102
+                    const parts = id.split('_');
+                    const dir = parts[1] === 'up' ? '上行' : '下行';
+
+                    let html = `
+                        <div class="info-block">
+                            <span class="info-label">区间 ID:</span>
+                            <span class="info-value">${id}</span>
+                        </div>
+                        <div class="info-block">
+                            <span class="info-label">运营方向:</span>
+                            <span class="info-value">${dir}</span>
+                        </div>
+                        <div class="info-block">
+                            <span class="info-label">计算出的生效窗口:</span>
+                            <div class="info-value">
+                                开始: ${minToTime(windowData.start)} (第${windowData.start}分)<br>
+                                结束: ${minToTime(windowData.end)} (第${windowData.end}分)
+                            </div>
+                        </div>
+                        <div class="info-block">
+                            <span class="info-label">当前状态:</span>
+                            <span class="info-value">${activeSegmentsCache.has(id) ? '🟢 运营中' : '⚫ 已停运'}</span>
+                        </div>
+                    `;
+
+                    modalContent.innerHTML = html;
+                    modal.style.display = 'block';
+                }
+            }
+        }
+
+        // ================= 新增：生成站点与区间的依赖关系 =================
+        function generateStationMap(stationList) {
+            const dependencyMap = {};
+
+            // 辅助函数：找 scheduleMap 里真正存在的 ID (解决 01_02 还是 02_01 的问题)
+            function getActiveSegId(prefix, id1, id2) {
+                // 先猜正常顺序
+                const k1 = `${prefix}_${id1}_${id2}`;
+                if (scheduleMap[k1]) return k1;
+                // 再猜反向顺序
+                const k2 = `${prefix}_${id2}_${id1}`;
+                if (scheduleMap[k2]) return k2;
+                return null;
+            }
+
+            // 确保列表排序 (Line -> UpOrdinal)
+            stationList.sort((a, b) => {
+                if (a.line_no !== b.line_no) return a.line_no - b.line_no;
+                return a.up_ordinal - b.up_ordinal;
+            });
+
+            for (let i = 0; i < stationList.length; i++) {
+                const curr = stationList[i];
+                const prev = stationList[i - 1]; // 上一站
+                const next = stationList[i + 1]; // 下一站
+                // ================== 【修改】 ==================
+                // 获取修正后的编号
+                const currNo = getFixedStationNo(curr.line_no, curr.station_no);
+                const prevNo = (prev && prev.line_no === curr.line_no) ? getFixedStationNo(prev.line_no, prev.station_no) : null;
+                const nextNo = (next && next.line_no === curr.line_no) ? getFixedStationNo(next.line_no, next.station_no) : null;
+                // =============================================
+                // 1. 收集当前站点可能连接的所有轨道 ID
+                const relatedSegments = {
+                    upIn: null,   // 上行进站 (Prev -> Curr)
+                    upOut: null,  // 上行出站 (Curr -> Next)
+                    downIn: null, // 下行进站 (Next -> Curr)
+                    downOut: null // 下行出站 (Curr -> Prev)
+                };
+
+                // 使用修正后的变量 (currNo, prevNo, nextNo)
+                if (prevNo) {
+                    relatedSegments.upIn = getActiveSegId('seg_up', prevNo, currNo);
+                    relatedSegments.downOut = getActiveSegId('seg_down', currNo, prevNo);
+                }
+
+                if (nextNo) {
+                    relatedSegments.upOut = getActiveSegId('seg_up', currNo, nextNo);
+                    relatedSegments.downIn = getActiveSegId('seg_down', nextNo, currNo);
+                }
+
+                // 使用修正后的 currNo 生成 DOM ID
+                const stationIdBase = `station_${currNo}`;
+
+                // 情况 A: 这是一个分体式站点 (有 _up 和 _down)
+                const elUp = document.getElementById(`${stationIdBase}_up`);
+                if (elUp) {
+                    // 上行站台依赖：上行进 + 上行出
+                    dependencyMap[elUp.id] = [relatedSegments.upIn, relatedSegments.upOut].filter(id => id);
+                }
+
+                const elDown = document.getElementById(`${stationIdBase}_down`);
+                if (elDown) {
+                    // 下行站台依赖：下行进 + 下行出
+                    dependencyMap[elDown.id] = [relatedSegments.downIn, relatedSegments.downOut].filter(id => id);
+                }
+
+                // 情况 B: 这是一个合体式站点 (只有 station_0101)
+                const elMain = document.getElementById(stationIdBase);
+                if (elMain) {
+                    // 主站台依赖：所有方向 (UpIn, UpOut, DownIn, DownOut)
+                    dependencyMap[elMain.id] = [
+                        relatedSegments.upIn, relatedSegments.upOut,
+                        relatedSegments.downIn, relatedSegments.downOut
+                    ].filter(id => id); // filter(id=>id) 去除 null，比如终点站没有出站轨道
+                }
+            }
+
+            return dependencyMap;
+        }
+
+        // ================= 修改后的 render 函数 =================
+        function render(currentTimeMinutes) {
+            const newActiveSet = new Set();
+
+            // --- 1. 计算区间的状态 (和之前一样) ---
+            for (const [id, window] of Object.entries(scheduleMap)) {
+                if (currentTimeMinutes >= window.start && currentTimeMinutes <= window.end) {
+                    newActiveSet.add(id);
+                }
+            }
+
+            // --- 2. 更新区间 DOM (和之前一样) ---
+            // 变灰
+            activeSegmentsCache.forEach(id => {
+                if (!newActiveSet.has(id)) {
+                    const el = document.getElementById(id);
+                    if (el) el.classList.add('disabled');
+                }
+            });
+            // 变亮
+            newActiveSet.forEach(id => {
+                if (!activeSegmentsCache.has(id)) {
+                    const el = document.getElementById(id);
+                    if (el) el.classList.remove('disabled');
+                }
+            });
+            activeSegmentsCache = newActiveSet; // 更新缓存
+
+            // --- 3. 新增：更新站点 (Station) 状态 ---
+            // 遍历所有在 SVG 里找到的站点
+            for (const [stationId, segIds] of Object.entries(stationDependencyMap)) {
+                const el = document.getElementById(stationId);
+                if (!el) continue;
+
+                // 核心逻辑：检查依赖的轨道里，是否“至少有一条”是活跃的
+                // newActiveSet 里存的是当前亮着的轨道 ID
+                const isStationActive = segIds.some(segId => newActiveSet.has(segId));
+
+                if (isStationActive) {
+                    // 只要有一条路通，站点就亮
+                    if (el.classList.contains('disabled')) {
+                        el.classList.remove('disabled');
+                    }
+                } else {
+                    // 所有路都不通 (Array.some 返回 false)，站点变灰
+                    if (!el.classList.contains('disabled')) {
+                        el.classList.add('disabled');
+                    }
+                }
+            }
+        }
+
+        function tick() {
+            let minutes;
+            // 注意：这里不再用 1560，而是用滑块的最大精度 10000
+            const SLIDER_MAX = 10000;
+
+            if (isLiveMode) {
+                // --- 实时模式 ---
+                const now = new Date();
+                let h = now.getHours();
+                const m = now.getMinutes();
+                if (h < 4) h += 24;
+                minutes = h * 60 + m;
+
+                // 1. 根据时间 -> 算出滑块应该在哪
+                const sliderPos = getSliderFromMinutes(minutes);
+
+                // 2. 更新滑块和红线
+                if (slider) slider.value = sliderPos;
+                if (visualThumb) visualThumb.style.left = `${sliderPos / SLIDER_MAX * 100}%`;
+
+            } else {
+                // --- 拖拽模式 ---
+                // 1. 读取滑块位置
+                const sliderVal = parseInt(slider.value, 10);
+
+                // 2. 根据滑块位置 -> 算出时间 (非线性)
+                minutes = getMinutesFromSlider(sliderVal);
+
+                // 3. 更新红线 (直接用滑块位置算百分比，保证绝对跟手)
+                if (visualThumb) visualThumb.style.left = `${sliderVal / SLIDER_MAX * 100}%`;
+            }
+
+            // 更新文字和地图
+            if (clock) clock.textContent = formatTime(minutes);
+            render(minutes);
+
+            // 循环
+            if (isLiveMode) {
+                requestAnimationFrame(tick);
+            }
+        }
+
+        // ================= 初始化入口 =================
+        (async function initApp() {
+            console.log("开始加载资源...");
+
+            // 【关键修复2】在这里获取 DOM 元素并赋值给全局变量
+            slider = document.getElementById('time-slider');
+            clock = document.getElementById('clock');
+            liveToggle = document.getElementById('live-toggle');
+            visualThumb = document.getElementById('custom-thumb'); // 获取视觉指针
+
+            const [_, allStations] = await Promise.all([
+                loadSVG(),
+                loadAllData()
+            ]);
+
+            console.log(`资源加载完毕，共获取 ${allStations.length} 个站点数据`);
+            const tip = document.getElementById('loading-tip');
+            if (tip) tip.style.display = 'none';
+
+            scheduleMap = processData(allStations);
+            console.log("区间时刻表生成:", scheduleMap);
+            // 【新增】3. 生成站点依赖表 (必须在 scheduleMap 生成之后)
+            stationDependencyMap = generateStationMap(allStations);
+            console.log("站点依赖关系:", stationDependencyMap);
+
+            // 【关键修复3】初始化 Diff 缓存
+            // 假设一开始所有线路都是亮的，填满缓存。
+            // 这样当第一帧 tick 运行时，如果当前是深夜，Diff 算法会发现 (All -> None)，从而把线路变灰。
+            activeSegmentsCache = new Set(Object.keys(scheduleMap));
+
+            // 在 initApp 函数内部，绑定事件监听的地方：
+
+            liveToggle.addEventListener('change', (e) => {
+                isLiveMode = e.target.checked;
+
+                if (isLiveMode) {
+                    // 【关键】勾选时，立即踢它一脚，让它开始跑
+                    tick();
+
+                    // 可选：禁用滑块，防止用户在自动跑的时候乱拖
+                    slider.disabled = true;
+                    // slider.style.opacity = '0.5'; // 视觉层已经接管了，slider 是透明的，不用改透明度
+                } else {
+                    // 取消勾选时，恢复滑块控制
+                    slider.disabled = false;
+                    // slider.style.opacity = '1';
+                }
+            });
+
+            slider.addEventListener('input', () => {
+                // 1. 只要一开始拖动，立刻取消实时模式
+                if (isLiveMode) {
+                    isLiveMode = false;
+                    if (liveToggle) liveToggle.checked = false;
+                    slider.disabled = false;
+                }
+
+                // 2. 立即更新视觉指针 (为了极其跟手)
+                // 直接用当前滑块的值 (0-10000) 算百分比
+                if (visualThumb) {
+                    const val = parseInt(slider.value, 10);
+                    const percent = val / 10000 * 100;
+                    visualThumb.style.left = `${percent}%`;
+                }
+
+                // 3. 触发一次 tick 计算时间并渲染地图
+                tick();
+            });
+
+            // 【新增】绑定地图点击事件
+            const mapContainer = document.getElementById('map-container');
+
+            // 使用 touchend 和 click 兼容处理
+            // 为防止拖拽时触发 click，可以简单判断一下
+            let isDragging = false;
+            mapContainer.addEventListener('mousedown', () => isDragging = false);
+            mapContainer.addEventListener('mousemove', () => isDragging = true);
+
+            mapContainer.addEventListener('click', (e) => {
+                // 如果 panzoom 正在被拖动，就不触发点击
+                // 注意：panzoom 的 dragging 状态判断比较微妙，这里用简单的 mousemove 判定
+                // 如果需要更精确，可以判断 mousedown 和 mouseup 的坐标差
+                if (isDragging) return;
+                handleMapClick(e);
+            });
+            // ...
+            tick();
+        })();
+    </script>
+</body>
+</html>
