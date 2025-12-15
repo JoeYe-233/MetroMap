@@ -188,7 +188,7 @@
 
         .modal-header h3 { margin: 0; font-size: 1.1em; }
 
-        .modal-body { padding: 15px; font-size: 0.9em; line-height: 1.6; }
+        .modal-body { padding: 15px; padding-bottom: 0px; font-size: 0.9em; line-height: 1.6; }
 
         .info-block { margin-bottom: 15px; }
         .info-label { font-weight: bold; color: #666; display: block; margin-bottom: 4px; }
@@ -220,7 +220,7 @@
             <input type="range" id="time-slider" min="0" max="10000" value="0">
         </div>
 
-        <div style="font-size: 12px; color: #999; text-align: center; margin-top: -10px; pointer-events: none;">
+        <div id="slider-hint" style="font-size: 12px; color: #999; text-align: center; margin-top: -10px; pointer-events: none;">
             此区域也可拖动进度条, 防止手指遮挡
         </div>
     </div>
@@ -273,7 +273,7 @@
         }
 
         // ... 你的 SVG_URL 等其他配置 ...
-        const SVG_URL = 'station_renamed_processed_merged_all_segmented_processed_renamed_by_geometry_plain_id_swapped.svg';
+        const SVG_URL = 'map.svg';
 
         // ================= 全局变量 =================
         let scheduleMap = {};
@@ -359,6 +359,16 @@
             let m = Math.floor(minutes % 60);
             if (h >= 24) h -= 24;
             return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+        }
+        // ================= 新增：反转箭头方向 =================
+        function flipArrow(arrow) {
+            const map = {
+                '→': '←', '←': '→',
+                '↑': '↓', '↓': '↑',
+                '↗': '↙', '↙': '↗',
+                '↘': '↖', '↖': '↘'
+            };
+            return map[arrow] || arrow;
         }
         // ================= 修正：基于 Path 切线的几何方向计算 =================
         function getArrowIcon(segId, stationId) {
@@ -630,7 +640,7 @@
             }
         }
 
-        // ================= 修复版 processData =================
+        // ================= 修复版 processData (支持时刻表合并) =================
         function processData(stationList) {
             const map = {};
 
@@ -649,47 +659,64 @@
                 return null;
             }
 
-            // 辅助函数：弱类型比较 (解决 "1002" !== 1002 的问题)
             function isSameId(a, b) {
                 if (a === null || b === null || a === undefined || b === undefined) return false;
                 return String(a).trim() === String(b).trim();
             }
 
-            // 填补跳站缝隙 (增强版)
+            // 填补缝隙
             function fillGapSegments(prefix, startNo, endNo, timeWindow) {
                 if (!startNo || !endNo || startNo.length < 4 || endNo.length < 4) return;
-
                 const linePrefix = startNo.substring(0, 2);
                 if (endNo.substring(0, 2) !== linePrefix) return;
-
                 const startIdx = parseInt(startNo.substring(2), 10);
                 const endIdx = parseInt(endNo.substring(2), 10);
                 const step = startIdx < endIdx ? 1 : -1;
-
                 if (Math.abs(endIdx - startIdx) <= 1) return;
-
                 let curr = startIdx;
-                // 防止死循环，加个上限
                 let safety = 0;
                 while (curr !== endIdx && safety < 50) {
                     safety++;
                     const next = curr + step;
-
                     const segStart = `${linePrefix}${curr.toString().padStart(2, '0')}`;
                     const segEnd = `${linePrefix}${next.toString().padStart(2, '0')}`;
-
                     const gapId = findValidId(prefix, segStart, segEnd);
-
-                    if (gapId) {
-                        map[gapId] = timeWindow;
-                    } else {
-                        // 调试：如果 0310 还是黑的，这里会告诉你为什么填补失败
-                        // console.warn(`填补失败: SVG中找不到 ${prefix}_${segStart}_${segEnd}`);
-                    }
+                    if (gapId) map[gapId] = timeWindow;
                     curr = next;
                 }
             }
 
+            // ================= 【核心修改：预处理 StationRawData】 =================
+            // 先清空，防止旧数据残留
+            stationRawData = {};
+
+            // 遍历所有数据，按 ID 合并时刻表
+            stationList.forEach(s => {
+                // 获取修正后的 ID
+                const fixedId = (typeof getFixedStationNo === 'function') ?
+                                getFixedStationNo(s.line_no, s.station_no) : s.station_no;
+
+                if (!stationRawData[fixedId]) {
+                    // 如果是第一次遇到这个站，初始化
+                    stationRawData[fixedId] = {
+                        name: s.station_name,
+                        line: s.line_name, // 记录第一条遇到的线路名
+                        timetables: []     // 容器
+                    };
+                }
+
+                // 【合并逻辑】将当前数据的时刻表追加到数组中
+                if (s.first_last_weekdays && Array.isArray(s.first_last_weekdays)) {
+                    // 使用 push(...array) 展开追加
+                    stationRawData[fixedId].timetables.push(...s.first_last_weekdays);
+
+                    // 可选：如果线路名不同（比如支线），可以拼接到 line 字段里
+                    // 但为了界面整洁，通常保留主线名或不做处理即可
+                }
+            });
+            // ====================================================================
+
+            // 2. 生成区间 Map
             for (let i = 0; i < stationList.length - 1; i++) {
                 const curr = stationList[i];
                 const next = stationList[i + 1];
@@ -699,16 +726,12 @@
                 const nextNo = (typeof getFixedStationNo === 'function') ?
                                getFixedStationNo(next.line_no, next.station_no) : next.station_no;
 
-                if (!stationRawData[currNo]) stationRawData[currNo] = { name: curr.station_name, line: curr.line_name, timetables: curr.first_last_weekdays };
-                if (!stationRawData[nextNo]) stationRawData[nextNo] = { name: next.station_name, line: next.line_name, timetables: next.first_last_weekdays };
-
                 if (curr.line_no !== next.line_no) continue;
 
-                // 检查是否为线路终点 (用于兜底自环)
-                // 如果 next 是当前线路列表里的最后一个，那它肯定是物理终点
+                // 兜底判定
                 const isLinePhysicalEnd = (i === stationList.length - 2) || (stationList[i+2] && stationList[i+2].line_no !== curr.line_no);
 
-                // ================= 上行处理 (Up) =================
+                // --- 上行 ---
                 let upStart = Infinity, upEnd = -Infinity, hasUp = false;
                 let isNextIsTerminal = false;
 
@@ -721,7 +744,6 @@
                                 upStart = Math.min(upStart, s);
                                 upEnd = Math.max(upEnd, e);
                                 hasUp = true;
-                                // 【修复1】使用弱类型比较
                                 if (isSameId(plan.up_end_station_no, next.station_no)) isNextIsTerminal = true;
                             }
                         }
@@ -730,27 +752,20 @@
 
                 if (hasUp && isFinite(upStart) && isFinite(upEnd)) {
                     const timeWindow = { start: upStart, end: upEnd };
-
                     const mainId = findValidId('seg_up', currNo, nextNo);
-                    if (mainId) {
-                        map[mainId] = timeWindow;
-                    } else {
-                        fillGapSegments('seg_up', currNo, nextNo, timeWindow);
-                    }
+                    if (mainId) map[mainId] = timeWindow;
+                    else fillGapSegments('seg_up', currNo, nextNo, timeWindow);
 
-                    // 站点自环 (出发)
                     const startLoopId = `seg_up_${currNo}_${currNo}`;
                     if (document.getElementById(startLoopId)) map[startLoopId] = timeWindow;
 
-                    // 站点自环 (终到)
-                    // 【修复2】如果是时刻表终点，或者物理终点，都点亮
                     if (isNextIsTerminal || isLinePhysicalEnd) {
                         const endLoopId = `seg_up_${nextNo}_${nextNo}`;
                         if (document.getElementById(endLoopId)) map[endLoopId] = timeWindow;
                     }
                 }
 
-                // ================= 下行处理 (Down) =================
+                // --- 下行 ---
                 let downStart = Infinity, downEnd = -Infinity, hasDown = false;
                 let isCurrIsTerminal = false;
 
@@ -763,7 +778,6 @@
                                 downStart = Math.min(downStart, s);
                                 downEnd = Math.max(downEnd, e);
                                 hasDown = true;
-                                // 【修复1】使用弱类型比较
                                 if (isSameId(plan.down_end_station_no, curr.station_no)) isCurrIsTerminal = true;
                             }
                         }
@@ -772,24 +786,14 @@
 
                 if (hasDown && isFinite(downStart) && isFinite(downEnd)) {
                     const timeWindow = { start: downStart, end: downEnd };
-
                     const mainId = findValidId('seg_down', nextNo, currNo);
-                    if (mainId) {
-                        map[mainId] = timeWindow;
-                    } else {
-                        fillGapSegments('seg_down', nextNo, currNo, timeWindow);
-                    }
+                    if (mainId) map[mainId] = timeWindow;
+                    else fillGapSegments('seg_down', nextNo, currNo, timeWindow);
 
-                    // 站点自环 (出发 - 下行从Next发)
                     const startLoopId = `seg_down_${nextNo}_${nextNo}`;
                     if (document.getElementById(startLoopId)) map[startLoopId] = timeWindow;
 
-                    // 站点自环 (终到 - 下行到Curr停)
-                    // 【修复2】增加兜底
-                    // 这里不能简单判断 isLinePhysicalEnd，因为下行方向 curr 是终点
-                    // 所以我们判断：如果 curr 是列表里的第一个(或者上一站是别线的)，那它就是下行终点
                     const isDownPhysicalEnd = (i === 0) || (stationList[i-1] && stationList[i-1].line_no !== curr.line_no);
-
                     if (isCurrIsTerminal || isDownPhysicalEnd) {
                         const endLoopId = `seg_down_${currNo}_${currNo}`;
                         if (document.getElementById(endLoopId)) map[endLoopId] = timeWindow;
@@ -819,9 +823,8 @@
             return `${h.toString().padStart(2, '0')}:${min.toString().padStart(2, '0')}`;
         }
 
-        // 处理地图点击
+        // ================= 修复版 handleMapClick =================
         function handleMapClick(e) {
-            // 1. 找到被点击的元素 (处理 SVG 冒泡)
             let target = e.target;
             while (target && target.tagName !== 'svg' && !target.id) {
                 target = target.parentNode;
@@ -836,42 +839,68 @@
                 if (!match) return;
 
                 const stationNo = match[1];
+                // 【修改】现在直接获取合并后的对象
                 const data = stationRawData[stationNo];
                 const dependencies = stationDependencyMap[id] || [];
 
-                // ... (前面的代码不变) ...
-
-                // 逻辑分支 1: 正常有数据
                 if (data) {
                     modalTitle.textContent = `${data.name} (${data.line})`;
 
-                    // === 1. 计算方向箭头 (Path 切线版) ===
+                    // === 1. 计算方向箭头 (优先找直连，没有则找自环并反转) ===
                     let upArrow = '';
                     let downArrow = '';
 
                     if (dependencies.length > 0) {
-                        // 利用规范的命名寻找出站线路
-                        // ID 格式: seg_up_当前站_下一站
-                        const upOutSeg = dependencies.find(segId => segId.startsWith(`seg_up_${stationNo}_`));
-                        const downOutSeg = dependencies.find(segId => segId.startsWith(`seg_down_${stationNo}_`));
+                        // A. 寻找正常的出站线路 (ID: seg_up_当前_下一站)
+                        // 排除掉自环的情况 (即排除 endsWith current)
+                        const upOutSeg = dependencies.find(segId =>
+                            segId.startsWith(`seg_up_${stationNo}_`) && !segId.endsWith(`_${stationNo}`)
+                        );
+                        const downOutSeg = dependencies.find(segId =>
+                            segId.startsWith(`seg_down_${stationNo}_`) && !segId.endsWith(`_${stationNo}`)
+                        );
 
-                        // 传入两个参数：(线路ID, 当前站点ID)
-                        if (upOutSeg) upArrow = getArrowIcon(upOutSeg, id);
-                        if (downOutSeg) downArrow = getArrowIcon(downOutSeg, id);
+                        // B. 寻找自环线路 (ID: seg_up_当前_当前)
+                        const upLoopSeg = dependencies.find(segId => segId === `seg_up_${stationNo}_${stationNo}`);
+                        const downLoopSeg = dependencies.find(segId => segId === `seg_down_${stationNo}_${stationNo}`);
+
+                        // --- 上行箭头计算 ---
+                        if (upOutSeg) {
+                            // 情况1: 中间站，直接用出站线路方向
+                            upArrow = getArrowIcon(upOutSeg, id);
+                        } else if (upLoopSeg) {
+                            // 情况2: 终点站，用自环方向并【反转】(模拟掉头)
+                            const rawArrow = getArrowIcon(upLoopSeg, id);
+                            upArrow = flipArrow(rawArrow);
+                        }
+
+                        // --- 下行箭头计算 ---
+                        if (downOutSeg) {
+                            downArrow = getArrowIcon(downOutSeg, id);
+                        } else if (downLoopSeg) {
+                            const rawArrow = getArrowIcon(downLoopSeg, id);
+                            downArrow = flipArrow(rawArrow);
+                        }
                     }
 
-                    // === 2. 数据分类与去重 ===
+                    // === 2. 数据分类与去重 (核心逻辑) ===
                     const upList = [];
                     const downList = [];
                     const seen = new Set();
 
+                    // 注意：现在 timetables 里已经包含了所有支线的数据
                     data.timetables.forEach(t => {
+                        // 【过滤无效数据】
+                        // 如果首末班时间全是 null 或空，说明这个方向不可用（比如终点站的继续前行方向）
+                        // 必须至少有一个时间有效才显示
+                        const hasUpTime = t.up_first_time || t.up_last_time;
+                        const hasDownTime = t.down_first_time || t.down_last_time;
+
                         // 处理上行
-                        if (t.up_end_station_name) {
+                        if (t.up_end_station_name && hasUpTime) {
                             const key = `up_${t.up_end_station_name}_${t.up_first_time}_${t.up_last_time}`;
                             if (!seen.has(key)) {
                                 upList.push({
-                                    // 【修改】加入箭头
                                     dir: `上行${upArrow}🟢`,
                                     dest: t.up_end_station_name,
                                     first: t.up_first_time || '--',
@@ -881,11 +910,10 @@
                             }
                         }
                         // 处理下行
-                        if (t.down_end_station_name) {
+                        if (t.down_end_station_name && hasDownTime) {
                             const key = `down_${t.down_end_station_name}_${t.down_first_time}_${t.down_last_time}`;
                             if (!seen.has(key)) {
                                 downList.push({
-                                    // 【修改】加入箭头
                                     dir: `下行${downArrow}🔵`,
                                     dest: t.down_end_station_name,
                                     first: t.down_first_time || '--',
@@ -920,7 +948,11 @@
                         });
                     }
 
-                    html += `</div>`;
+                    if (upList.length === 0 && downList.length === 0) {
+                        html += `<div style="color:#999;">本站暂无服务</div>`;
+                    }
+
+                    html += `</div>`; // end info-block
 
                     // // 依赖信息 (保持不变)
                     // html += `<div class="info-block"><span class="info-label">Render 依赖 (调试用):</span><div class="dep-list">`;
@@ -945,7 +977,7 @@
                     modalTitle.textContent = svgName ? `${svgName} (未开通)` : `站点 ${stationNo}`;
 
                     let html = `
-                        <div class="info-block" style="text-align: center; padding: 20px 0;">
+                        <div class="info-block" style="text-align: center; padding-bottom: 5px;">
                             <div style="font-size: 40px; margin-bottom: 10px;">🚧</div>
                             <h3 style="color: #666; margin: 0;">暂未开通</h3>
                             <p style="color: #999; font-size: 0.9em; margin-top: 5px;">Coming Soon</p>
@@ -962,7 +994,7 @@
                 else {
                     modalTitle.textContent = "数据缺失";
                     let html = `
-                        <div class="info-block" style="text-align: center; padding: 20px 0;">
+                        <div class="info-block" style="text-align: center; padding-bottom: 5px;">
                             <div style="font-size: 40px; margin-bottom: 10px;">❓</div>
                             <h3 style="color: #666; margin: 0;">无数据</h3>
                             <p style="color: #999; font-size: 0.9em; margin-top: 5px;">ID 未知或映射错误</p>
@@ -1015,9 +1047,9 @@
                 else if (unopenedSet.has(id)) {
                      modalTitle.textContent = "未开通区间";
                      let html = `
-                        <div class="info-block" style="text-align: center; padding: 20px 0;">
+                        <div class="info-block" style="text-align: center; padding-bottom: 5px;">
                             <div style="font-size: 30px; margin-bottom: 10px;">🚫</div>
-                            <p style="color: #999;">该路段暂未运营</p>
+                            <p style="color: #999;">该区段暂未开通运营</p>
                         </div>
                         <div class="info-block">
                             <span class="info-label">区间 ID:</span>
@@ -1032,7 +1064,7 @@
                     // 通常线路不太会进这里，除非 id 格式对但没被识别
                     modalTitle.textContent = "数据异常";
                      let html = `
-                        <div class="info-block" style="text-align: center; padding: 20px 0;">
+                        <div class="info-block" style="text-align: center; padding-bottom: 5px;">
                             <div style="font-size: 30px; margin-bottom: 10px;">⚠️</div>
                             <p style="color: #999;">未知路段</p>
                         </div>
@@ -1047,7 +1079,7 @@
             }
         }
 
-        // ================= 修复版 generateStationMap (支持自环与缝隙) =================
+        // ================= 修复版 generateStationMap (支持非连续ID) =================
         function generateStationMap(stationList) {
             const dependencyMap = {};
 
@@ -1057,137 +1089,99 @@
                 return a.up_ordinal - b.up_ordinal;
             });
 
-            // 辅助：检查某个 ID 是否是活跃的轨道
-            function isSegActive(id) {
-                return scheduleMap[id] !== undefined;
+            // 辅助：获取修正后的 SVG ID
+            function getID(stationObj) {
+                if (!stationObj) return null;
+                return (typeof getFixedStationNo === 'function') ?
+                       getFixedStationNo(stationObj.line_no, stationObj.station_no) : stationObj.station_no;
             }
 
-            // 辅助：智能查找依赖 (处理直连、缝隙、反向)
-            // linePrefix: "03", targetNo: "0310", direction: "up" (找入站) / "down" (找入站)
-            function findPhysicalInboundSeg(linePrefix, targetNo, direction) {
-                const targetIdx = parseInt(targetNo.substring(2), 10);
-
-                // 如果是上行(Up)进站，物理上一站应该是 Idx - 1
-                // 如果是下行(Down)进站，物理上一站应该是 Idx + 1
-                const neighborIdx = direction === 'up' ? targetIdx - 1 : targetIdx + 1;
-
-                // 拼出物理邻居的编号
-                const neighborNo = `${linePrefix}${neighborIdx.toString().padStart(2, '0')}`;
-
-                // 尝试拼凑 ID
-                // Up: Neighbor -> Target
-                // Down: Neighbor -> Target (注意：下行也是从 neighbor(大) 开往 target(小))
-
-                // 这里的命名逻辑是：
-                // seg_up_0309_0310
-                // seg_down_0311_0310
-
-                let candidateId;
-                if (direction === 'up') {
-                    candidateId = `seg_up_${neighborNo}_${targetNo}`;
-                } else {
-                    candidateId = `seg_down_${neighborNo}_${targetNo}`;
+            // 辅助：检查并添加依赖
+            function checkAndAdd(segId, depsList) {
+                // 1. 检查 scheduleMap (活跃中)
+                if (scheduleMap[segId]) {
+                    depsList.push(segId);
+                    return true;
                 }
-
-                // 1. 检查正常顺序
-                if (scheduleMap[candidateId]) return candidateId;
-
-                // 2. 检查反向 ID (SVG 命名容错)
-                const reverseId = direction === 'up'
-                    ? `seg_up_${targetNo}_${neighborNo}`
-                    : `seg_down_${targetNo}_${neighborNo}`;
-                if (scheduleMap[reverseId]) return reverseId;
-
-                return null;
-            }
-
-            // 辅助：查找出站轨道 (逻辑同上，只是找 target -> neighbor)
-            function findPhysicalOutboundSeg(linePrefix, targetNo, direction) {
-                const targetIdx = parseInt(targetNo.substring(2), 10);
-                const neighborIdx = direction === 'up' ? targetIdx + 1 : targetIdx - 1;
-                const neighborNo = `${linePrefix}${neighborIdx.toString().padStart(2, '0')}`;
-
-                let candidateId;
-                if (direction === 'up') {
-                    candidateId = `seg_up_${targetNo}_${neighborNo}`;
-                } else {
-                    candidateId = `seg_down_${targetNo}_${neighborNo}`;
+                // 2. 检查 DOM (暂未开通但存在) - 这一步保证了未开通的灰线也能被识别
+                if (document.getElementById(segId)) {
+                    depsList.push(segId);
+                    return true;
                 }
-
-                if (scheduleMap[candidateId]) return candidateId;
-
-                const reverseId = direction === 'up'
-                    ? `seg_up_${neighborNo}_${targetNo}`
-                    : `seg_down_${neighborNo}_${targetNo}`;
-                if (scheduleMap[reverseId]) return reverseId;
-
-                return null;
+                return false;
             }
-
 
             for (let i = 0; i < stationList.length; i++) {
                 const curr = stationList[i];
+                const prev = stationList[i - 1]; // 列表里的前一个对象
+                const next = stationList[i + 1]; // 列表里的后一个对象
 
-                // 获取修正后的 ID
-                const currNo = (typeof getFixedStationNo === 'function') ?
-                               getFixedStationNo(curr.line_no, curr.station_no) : curr.station_no;
+                // 获取修正后的编号
+                const currNo = getID(curr);
 
-                const linePrefix = currNo.substring(0, 2); // 例如 "03"
+                // 仅当 prev/next 与当前站点属于同一条线时，才视为有效邻居
+                const prevNo = (prev && prev.line_no === curr.line_no) ? getID(prev) : null;
+                const nextNo = (next && next.line_no === curr.line_no) ? getID(next) : null;
 
                 // 收集依赖
                 const deps = [];
 
-                // ================= 1. 自环依赖 (Terminals 的救星) =================
-                // 如果这个站有自环 (0310_0310)，且自环是亮的，那这个站必须亮
+                // ================= 1. 自环依赖 =================
                 const selfUp = `seg_up_${currNo}_${currNo}`;
                 const selfDown = `seg_down_${currNo}_${currNo}`;
-
-                // 只要 SVG 里有，且在 scheduleMap 里，就加入依赖
                 if (document.getElementById(selfUp)) deps.push(selfUp);
                 if (document.getElementById(selfDown)) deps.push(selfDown);
 
-                // ================= 2. 物理邻居嗅探 (解决 Gap 问题) =================
-                // 不管 JSON 里的 prev/next 是谁，我们只看 SVG 里物理连接的那根线
+                // ================= 2. 物理邻居嗅探 (基于列表关系) =================
+                // 这里不再进行数字加减，而是直接拼接 prevNo 和 nextNo
 
-                // 上行进站 (Physicial Prev -> Curr)
-                const upIn = findPhysicalInboundSeg(linePrefix, currNo, 'up');
-                if (upIn) deps.push(upIn);
+                // --- 上行 (Up) ---
+                // 进站: Prev -> Curr
+                if (prevNo) {
+                    const seg1 = `seg_up_${prevNo}_${currNo}`; // 正向
+                    const seg2 = `seg_up_${currNo}_${prevNo}`; // 反向容错
+                    if (!checkAndAdd(seg1, deps)) checkAndAdd(seg2, deps);
+                }
+                // 出站: Curr -> Next
+                if (nextNo) {
+                    const seg1 = `seg_up_${currNo}_${nextNo}`;
+                    const seg2 = `seg_up_${nextNo}_${currNo}`;
+                    if (!checkAndAdd(seg1, deps)) checkAndAdd(seg2, deps);
+                }
 
-                // 上行出站 (Curr -> Physical Next)
-                const upOut = findPhysicalOutboundSeg(linePrefix, currNo, 'up');
-                if (upOut) deps.push(upOut);
-
-                // 下行进站 (Physical Next -> Curr)
-                const downIn = findPhysicalInboundSeg(linePrefix, currNo, 'down');
-                if (downIn) deps.push(downIn);
-
-                // 下行出站 (Curr -> Physical Prev)
-                const downOut = findPhysicalOutboundSeg(linePrefix, currNo, 'down');
-                if (downOut) deps.push(downOut);
-
+                // --- 下行 (Down) ---
+                // 进站: Next -> Curr (注意下行是反着开的)
+                if (nextNo) {
+                    const seg1 = `seg_down_${nextNo}_${currNo}`;
+                    const seg2 = `seg_down_${currNo}_${nextNo}`;
+                    if (!checkAndAdd(seg1, deps)) checkAndAdd(seg2, deps);
+                }
+                // 出站: Curr -> Prev
+                if (prevNo) {
+                    const seg1 = `seg_down_${currNo}_${prevNo}`;
+                    const seg2 = `seg_down_${prevNo}_${currNo}`;
+                    if (!checkAndAdd(seg1, deps)) checkAndAdd(seg2, deps);
+                }
 
                 // ================= 3. 绑定到 DOM =================
                 const stationIdBase = `station_${currNo}`;
 
-                // 分体式站点 (_up / _down)
+                // 分体式站点
                 const elUp = document.getElementById(`${stationIdBase}_up`);
                 if (elUp) {
-                    // 上行站台只关心: 自环Up, 上行进, 上行出
                     const myDeps = deps.filter(id => id.includes('seg_up') || id === selfUp);
                     dependencyMap[elUp.id] = myDeps;
                 }
 
                 const elDown = document.getElementById(`${stationIdBase}_down`);
                 if (elDown) {
-                    // 下行站台只关心: 自环Down, 下行进, 下行出
                     const myDeps = deps.filter(id => id.includes('seg_down') || id === selfDown);
                     dependencyMap[elDown.id] = myDeps;
                 }
 
-                // 合体式站点 (station_0310)
+                // 合体式站点
                 const elMain = document.getElementById(stationIdBase);
                 if (elMain) {
-                    // 只要有任意方向的连接，就亮
                     dependencyMap[elMain.id] = deps;
                 }
             }
@@ -1320,7 +1314,21 @@
             activeSegmentsCache = new Set(Object.keys(scheduleMap));
 
             // 在 initApp 函数内部，绑定事件监听的地方：
+// ... (前面的代码不变) ...
 
+            // 【新增】获取提示文字元素
+            const sliderHint = document.getElementById('slider-hint');
+
+            // 辅助函数：更新提示文字
+            function updateHintText() {
+                if (sliderHint) {
+                    sliderHint.textContent = isLiveMode
+                        ? "实时模式, 进度条已禁用"
+                        : "此区域也可拖动进度条, 防止手指遮挡";
+                }
+            }
+
+            // 1. 复选框切换事件
             liveToggle.addEventListener('change', (e) => {
                 isLiveMode = e.target.checked;
 
@@ -1336,6 +1344,9 @@
                     slider.disabled = false;
                     // slider.style.opacity = '1';
                 }
+
+                // 【新增】更新文字
+                updateHintText();
             });
 
             slider.addEventListener('input', () => {
@@ -1344,6 +1355,9 @@
                     isLiveMode = false;
                     if (liveToggle) liveToggle.checked = false;
                     slider.disabled = false;
+
+                    // 【新增】状态变了，更新文字
+                    updateHintText();
                 }
 
                 // 2. 立即更新视觉指针 (为了极其跟手)
@@ -1357,7 +1371,7 @@
                 // 3. 触发一次 tick 计算时间并渲染地图
                 tick();
             });
-
+            // 启动
             tick();
         })();
     </script>
